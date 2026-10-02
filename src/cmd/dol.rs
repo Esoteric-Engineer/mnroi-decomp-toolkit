@@ -242,9 +242,9 @@ pub struct ProjectConfig {
     /// will be used from the disc image directly without extraction.
     #[serde(default = "bool_true", skip_serializing_if = "is_true")]
     pub extract_objects: bool,
-    /// The original binary addresses `.sdata2`/`.sbss2` through `r13` (`_SDA_BASE_`),
-    /// e.g. games linked with SN Systems' `ngcld`. Bakes those accesses in split objects,
-    /// and writes `sda_bake.json` for `dtk elf bake-sda` to do the same for compiled objects.
+    /// The original binary addresses `.sdata2`/`.sbss2` through `r13` (`_SDA_BASE_`), e.g. games linked with SN Systems' `ngcld`.
+    // Converts those accesses in split objects into `r13`-based `@l` relocations that survive the link, and writes `sda_bake.json` for `dtk elf bake-sda` to do the same for compiled objects.
+    // `dtk elf resolve-sda` then resolves them in the linked executable.
     #[serde(default, skip_serializing_if = "is_default")]
     pub sda2_via_r13: bool,
 }
@@ -979,8 +979,9 @@ fn load_analyze_dol(config: &ProjectConfig, object_base: &ObjectBase) -> Result<
     Ok(AnalyzeResult { obj, dep, symbols_cache, splits_cache })
 }
 
-/// Removes small-data relocations whose register disagrees with the `mwld`-derived register from the target section.
+/// Handles small-data relocations whose register disagrees with the `mwld`-derived register from the target section.
 fn bake_conflicting_sda_relocations(obj: &mut ObjInfo) {
+    let mut to_convert = Vec::new();
     let mut to_remove = Vec::new();
     for (section_index, section) in obj.sections.iter() {
         for (addr, reloc) in section.relocations.iter() {
@@ -1007,8 +1008,18 @@ fn bake_conflicting_sda_relocations(obj: &mut ObjInfo) {
             };
             let ins = u32::from_be_bytes(bytes.try_into().unwrap());
             let original_reg = ((ins >> 16) & 0x1F) as u8;
-            if original_reg != mwld_reg {
+            if original_reg == 13 && mwld_reg == 2 {
+                to_convert.push((section_index, addr));
+            } else if original_reg != mwld_reg {
                 to_remove.push((section_index, addr));
+            }
+        }
+    }
+    if !to_convert.is_empty() {
+        debug!("Converting {} small-data relocation(s) to r13-based @l", to_convert.len());
+        for (section_index, addr) in to_convert {
+            if let Some(reloc) = obj.sections[section_index].relocations.at_mut(addr) {
+                reloc.kind = ObjRelocKind::PpcAddr16Lo;
             }
         }
     }
@@ -2500,7 +2511,7 @@ mod test {
     }
 
     #[test]
-    fn bake_removes_only_register_conflicting_sda_relocations() {
+    fn bake_converts_r13_sdata2_and_removes_other_conflicts() {
         fn section(
             name: &str,
             kind: ObjSectionKind,
@@ -2538,6 +2549,7 @@ mod test {
         text.extend_from_slice(&0x800D0000u32.to_be_bytes());
         text.extend_from_slice(&0x800D0000u32.to_be_bytes());
         text.extend_from_slice(&0x80020000u32.to_be_bytes());
+        text.extend_from_slice(&0x80000000u32.to_be_bytes());
         let sections = vec![
             section(".text", ObjSectionKind::Code, 0x80003000, text),
             section(".sdata", ObjSectionKind::Data, 0x80100000, vec![0; 0x100]),
@@ -2554,13 +2566,21 @@ mod test {
         obj.sections[0].relocations.insert(0x80003000, sda21(0)).unwrap();
         obj.sections[0].relocations.insert(0x80003004, sda21(1)).unwrap();
         obj.sections[0].relocations.insert(0x80003008, sda21(1)).unwrap();
+        obj.sections[0].relocations.insert(0x8000300C, sda21(0)).unwrap();
 
         bake_conflicting_sda_relocations(&mut obj);
 
         let relocs = &obj.sections[0].relocations;
-        assert_eq!(relocs.len(), 2);
-        assert!(relocs.at(0x80003000).is_some());
-        assert!(relocs.at(0x80003004).is_none());
-        assert!(relocs.at(0x80003008).is_some());
+        assert_eq!(relocs.len(), 3);
+        // r13 -> .sdata: no conflict
+        assert_eq!(relocs.at(0x80003000).unwrap().kind, ObjRelocKind::PpcEmbSda21);
+        // r13 -> .sdata2: converted, same target
+        let converted = relocs.at(0x80003004).unwrap();
+        assert_eq!(converted.kind, ObjRelocKind::PpcAddr16Lo);
+        assert_eq!(converted.target_symbol, 1);
+        // r2 -> .sdata2: no conflict
+        assert_eq!(relocs.at(0x80003008).unwrap().kind, ObjRelocKind::PpcEmbSda21);
+        // r0 -> .sdata: other conflicts are removed
+        assert!(relocs.at(0x8000300C).is_none());
     }
 }

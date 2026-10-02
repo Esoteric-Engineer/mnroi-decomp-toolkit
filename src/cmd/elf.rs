@@ -26,7 +26,7 @@ use crate::{
         file::{buf_writer, process_rsp},
         path::native_path,
         reader::{Endian, FromReader},
-        sda_bake::{SdaBakeData, bake_object},
+        sda_bake::{SdaBakeData, bake_object, resolve_executable},
         signatures::{FunctionSignature, compare_signature, generate_signature},
         split::split_obj,
     },
@@ -47,6 +47,7 @@ enum SubCommand {
     Disasm(DisasmArgs),
     Fixup(FixupArgs),
     BakeSda(BakeSdaArgs),
+    ResolveSda(ResolveSdaArgs),
     Signatures(SignaturesArgs),
     Info(InfoArgs),
 }
@@ -76,18 +77,28 @@ pub struct FixupArgs {
 }
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
-/// Bakes `.sdata2`/`.sbss2` small-data relocations as fixed `r13`-relative accesses.
-/// Requires `sda2_via_r13: true` in the project config.
+/// Converts `.sdata2`/`.sbss2` small-data relocations in a compiled object into `r13`-based accesses that
+/// survive the link, for `resolve-sda` to finish. Requires `sda2_via_r13: true` in the project config.
 #[argp(subcommand, name = "bake-sda")]
 pub struct BakeSdaArgs {
     #[argp(positional, from_str_fn(native_path))]
     /// sda_bake.json written by `dol split`
     bake_file: Utf8NativePathBuf,
-    #[argp(positional)]
-    /// unit name, as in splits.txt
-    unit: String,
     #[argp(positional, from_str_fn(native_path))]
     /// input file
+    in_file: Utf8NativePathBuf,
+    #[argp(positional, from_str_fn(native_path))]
+    /// output file
+    out_file: Utf8NativePathBuf,
+}
+
+#[derive(FromArgs, PartialEq, Eq, Debug)]
+/// Resolves the `r13`-based `.sdata2`/`.sbss2` accesses that `bake-sda` and `dol split` prepared, in a linked
+/// executable, from its final layout.
+#[argp(subcommand, name = "resolve-sda")]
+pub struct ResolveSdaArgs {
+    #[argp(positional, from_str_fn(native_path))]
+    /// input file (linked ELF)
     in_file: Utf8NativePathBuf,
     #[argp(positional, from_str_fn(native_path))]
     /// output file
@@ -136,6 +147,7 @@ pub fn run(args: Args) -> Result<()> {
         SubCommand::Disasm(c_args) => disasm(c_args),
         SubCommand::Fixup(c_args) => fixup(c_args),
         SubCommand::BakeSda(c_args) => bake_sda(c_args),
+        SubCommand::ResolveSda(c_args) => resolve_sda(c_args),
         SubCommand::Signatures(c_args) => signatures(c_args),
         SubCommand::Info(c_args) => info(c_args),
     }
@@ -219,9 +231,20 @@ fn bake_sda(args: BakeSdaArgs) -> Result<()> {
     .with_context(|| format!("Failed to parse bake file: '{}'", args.bake_file))?;
     let mut data = fs::read(&args.in_file)
         .with_context(|| format!("Failed to open input file: '{}'", args.in_file))?;
-    let baked = bake_object(&mut data, &bake, &args.unit)
-        .with_context(|| format!("Failed to bake '{}' (unit '{}')", args.in_file, args.unit))?;
-    log::debug!("Baked {baked} small-data relocation(s) in '{}'", args.in_file);
+    let baked = bake_object(&mut data, &bake)
+        .with_context(|| format!("Failed to bake '{}'", args.in_file))?;
+    log::debug!("Converted {baked} small-data relocation(s) in '{}'", args.in_file);
+    fs::write(&args.out_file, data)
+        .with_context(|| format!("Failed to write output file: '{}'", args.out_file))?;
+    Ok(())
+}
+
+fn resolve_sda(args: ResolveSdaArgs) -> Result<()> {
+    let mut data = fs::read(&args.in_file)
+        .with_context(|| format!("Failed to open input file: '{}'", args.in_file))?;
+    let resolved = resolve_executable(&mut data)
+        .with_context(|| format!("Failed to resolve small data in '{}'", args.in_file))?;
+    log::debug!("Resolved {resolved} small-data access(es) in '{}'", args.in_file);
     fs::write(&args.out_file, data)
         .with_context(|| format!("Failed to write output file: '{}'", args.out_file))?;
     Ok(())

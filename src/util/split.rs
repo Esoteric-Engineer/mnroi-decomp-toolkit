@@ -1229,7 +1229,10 @@ fn resolve_link_order(obj: &ObjInfo) -> Result<Vec<ObjUnit>> {
 
     for (_section_index, section) in obj.sections.iter() {
         let mut iter = section.splits.iter().peekable();
-        if section.name == ".ctors" || section.name == ".dtors" {
+        // A ProDG list starts with -1, which has to stay first
+        if (section.name == ".ctors" || section.name == ".dtors")
+            && read_u32(section, section.address as u32) != Some(0xFFFFFFFF)
+        {
             // Skip __init_cpp_exceptions.o
             let skipped = iter.next();
             log::debug!("Skipping split {:?} (next: {:?})", skipped, iter.peek());
@@ -1741,11 +1744,11 @@ pub fn end_for_section(obj: &ObjInfo, section_index: SectionIndex) -> Result<Sec
         return Ok(SectionAddress::new(section_index, section_end));
     }
     // .ctors and .dtors end with a linker-generated null pointer,
-    // adjust section size appropriately
-    if matches!(section.name.as_str(), ".ctors" | ".dtors")
-        && section.data[section.data.len() - 4..] == [0u8; 4]
-    {
-        section_end -= 4;
+    // adjust section size appropriately. ProDG sections split from a shared DOL section
+    // also keep the alignment padding after it.
+    if matches!(section.name.as_str(), ".ctors" | ".dtors") {
+        let zero_words = section.data.rchunks_exact(4).take_while(|word| *word == [0u8; 4]).count();
+        section_end -= zero_words as u32 * 4;
     }
     loop {
         let last_symbol =

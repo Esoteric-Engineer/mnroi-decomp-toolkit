@@ -2,8 +2,11 @@
 //!
 //! Some games (e.g. those linked with SN Systems' `ngcld`) address *all* small data through `r13`, including `.sdata2`/`.sbss2`.
 //! `mwld` always resolves `R_PPC_EMB_SDA21` relocations against those sections via `r2`, so compiled code referencing them fails to link/match.
-//! `dtk dol split` records the addresses needed to resolve these relocations ahead of the link.
-//! `dtk elf bake-sda` rewrites each affected instruction to use `r13` with a fixed displacement, removing the relocation.
+//! Fixed displacements would pin every such access to the original layout. Instead, the access survives the link as an `R_PPC_ADDR16_LO` relocation on an `r13`-based instruction.
+//! `mwld` resolves this without a range check:
+//! - `dtk dol split` converts split objects' conflicting relocations, and records which `.sdata2`/`.sbss2` symbols exist so that compiled objects' references to them can be recognised
+//! - `dtk elf bake-sda` converts compiled objects' relocations before the link
+//! - `dtk elf resolve-sda` rewrites each one in the linked executable as `symbol + addend - _SDA_BASE_`, from the final layout, and turns the relocation back into `R_PPC_EMB_SDA21`
 
 use std::collections::BTreeMap;
 
@@ -22,12 +25,11 @@ fn is_sda2_section(name: &str) -> bool {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SdaBakeData {
-    /// Value of `_SDA_BASE_` (`r13`).
+    /// Value of `_SDA_BASE_` (`r13`) in the original binary. Informational: nothing is baked against it.
     pub sda_base: u32,
-    /// Address of every global symbol located in `.sdata2`/`.sbss2`, by name.
+    /// Every global symbol located in `.sdata2`/`.sbss2`, by name, with its address in the original binary.
+    /// `bake-sda` only uses the names, to recognise references to undefined symbols.
     pub symbols: BTreeMap<String, u32>,
-    /// Start address of each unit's `.sdata2`/`.sbss2` split, by unit name and section name.
-    pub units: BTreeMap<String, BTreeMap<String, u32>>,
 }
 
 impl SdaBakeData {
@@ -38,20 +40,12 @@ impl SdaBakeData {
             if !is_sda2_section(&section.name) {
                 continue;
             }
-            let section_name = section.name.split(':').next().unwrap_or(&section.name);
             for (_, symbol) in obj.symbols.for_section(section_index) {
                 // Only globals can be referenced from other objects
                 if symbol.name.is_empty() || symbol.flags.is_local() {
                     continue;
                 }
                 data.symbols.insert(symbol.name.clone(), symbol.address as u32);
-            }
-            for (addr, split) in section.splits.iter() {
-                data.units
-                    .entry(split.unit.clone())
-                    .or_default()
-                    .entry(section_name.to_string())
-                    .or_insert(addr);
             }
         }
         Ok(data)
@@ -61,6 +55,7 @@ impl SdaBakeData {
 struct SectionHeader {
     name: String,
     kind: u32,
+    addr: u32,
     offset: usize,
     size: usize,
     link: u32,
@@ -88,13 +83,17 @@ fn read_str(data: &[u8], offset: usize) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-fn read_section_headers(data: &[u8]) -> Result<(usize, usize, Vec<SectionHeader>)> {
+fn read_section_headers(data: &[u8], e_type: u16) -> Result<(usize, usize, Vec<SectionHeader>)> {
     ensure!(data.get(..4) == Some(&elf::ELFMAG[..]), "Not an ELF file");
     ensure!(
         data.get(4) == Some(&elf::ELFCLASS32) && data.get(5) == Some(&elf::ELFDATA2MSB),
         "Expected a 32-bit big-endian ELF"
     );
-    ensure!(read_u16(data, 16)? == elf::ET_REL, "Expected a relocatable object");
+    ensure!(
+        read_u16(data, 16)? == e_type,
+        "Expected {}",
+        if e_type == elf::ET_REL { "a relocatable object" } else { "an executable" }
+    );
     let shoff = read_u32(data, 32)? as usize;
     let shentsize = read_u16(data, 46)? as usize;
     let shnum = read_u16(data, 48)? as usize;
@@ -108,6 +107,7 @@ fn read_section_headers(data: &[u8]) -> Result<(usize, usize, Vec<SectionHeader>
         headers.push(SectionHeader {
             name: String::new(),
             kind: read_u32(data, base + 4)?,
+            addr: read_u32(data, base + 12)?,
             offset: read_u32(data, base + 16)? as usize,
             size: read_u32(data, base + 20)? as usize,
             link: read_u32(data, base + 24)?,
@@ -123,13 +123,18 @@ fn read_section_headers(data: &[u8]) -> Result<(usize, usize, Vec<SectionHeader>
     Ok((shoff, shentsize, headers))
 }
 
-/// Rewrites every `R_PPC_EMB_SDA21` relocation targeting `.sdata2`/`.sbss2` in the relocatable
-/// object `data` as a fixed `r13`-relative access, and removes the relocation.
-/// Returns the number of relocations baked.
-pub fn bake_object(data: &mut [u8], bake: &SdaBakeData, unit: &str) -> Result<usize> {
-    let (shoff, shentsize, headers) = read_section_headers(data)?;
+/// Whether `ins` is a D-form instruction whose 16-bit displacement a small-data relocation can address.
+fn is_sda_dform(ins: u32) -> bool {
+    let op = ins >> 26;
+    op == 14 || (32..=55).contains(&op)
+}
+
+/// Converts every `R_PPC_EMB_SDA21` relocation targeting `.sdata2`/`.sbss2` into `R_PPC_ADDR16_LO` relocation with `r13` instruction.
+/// Returns the number of relocations converted.
+pub fn bake_object(data: &mut [u8], bake: &SdaBakeData) -> Result<usize> {
+    let (_, _, headers) = read_section_headers(data, elf::ET_REL)?;
     let mut baked = 0;
-    for (rela_index, rela) in headers.iter().enumerate() {
+    for rela in headers.iter() {
         if rela.kind != elf::SHT_RELA || rela.size == 0 {
             continue;
         }
@@ -146,84 +151,127 @@ pub fn bake_object(data: &mut [u8], bake: &SdaBakeData, unit: &str) -> Result<us
             .offset;
         let sym_entsize = if symtab.entsize == 0 { 16 } else { symtab.entsize };
 
-        let mut kept = Vec::with_capacity(rela.size / entsize);
-        let mut patches = Vec::new();
         for entry_offset in (rela.offset..rela.offset + rela.size).step_by(entsize) {
-            let entry = data[entry_offset..entry_offset + entsize].to_vec();
-            let r_offset = read_u32(data, entry_offset)? as usize;
+            let r_offset = read_u32(data, entry_offset)?;
             let r_info = read_u32(data, entry_offset + 4)?;
-            let r_addend = read_u32(data, entry_offset + 8)? as i32;
             if r_info & 0xFF != elf::R_PPC_EMB_SDA21 {
-                kept.push(entry);
                 continue;
             }
             let sym = symtab.offset + (r_info >> 8) as usize * sym_entsize;
             let st_name = read_u32(data, sym)? as usize;
-            let st_value = read_u32(data, sym + 4)?;
             let st_shndx = read_u16(data, sym + 14)?;
             let name = read_str(data, strtab + st_name)?;
-            let address = if st_shndx == elf::SHN_UNDEF {
-                match bake.symbols.get(&name) {
-                    Some(&address) => address,
-                    None => {
-                        kept.push(entry);
-                        continue;
-                    }
-                }
+            let is_sda2 = if st_shndx == elf::SHN_UNDEF {
+                bake.symbols.contains_key(&name)
             } else {
-                let Some(section) = headers.get(st_shndx as usize) else {
-                    kept.push(entry);
-                    continue;
-                };
-                if !is_sda2_section(&section.name) {
-                    kept.push(entry);
-                    continue;
-                }
-                let start = bake
-                    .units
-                    .get(unit)
-                    .and_then(|sections| sections.get(&section.name))
-                    .ok_or_else(|| {
-                    anyhow!(
-                        "Symbol '{}' is in {}, but unit '{}' has no {} split",
-                        name,
-                        section.name,
-                        unit,
-                        section.name
-                    )
-                })?;
-                start.wrapping_add(st_value)
+                headers.get(st_shndx as usize).is_some_and(|section| is_sda2_section(&section.name))
             };
-            let disp = address.wrapping_add(r_addend as u32).wrapping_sub(bake.sda_base) as i32;
-            let Ok(disp) = i16::try_from(disp) else {
-                bail!(
-                    "Symbol '{}' at {:#010X} is out of range of _SDA_BASE_ ({:#010X})",
-                    name,
-                    address,
-                    bake.sda_base
-                );
-            };
+            if !is_sda2 {
+                continue;
+            }
             // mwcc points the relocation at the low halfword of the instruction
-            patches.push((target.offset + (r_offset & !3), disp));
-        }
-        if patches.is_empty() {
-            continue;
-        }
-        for (ins_offset, disp) in patches {
+            let ins_offset = target.offset + (r_offset & !3) as usize;
             let ins = read_u32(data, ins_offset)?;
-            write_u32(data, ins_offset, (ins & !0x1F_FFFF) | (13 << 16) | (disp as u16 as u32));
+            ensure!(
+                is_sda_dform(ins),
+                "Small-data relocation on '{}' at {:#X} is not on a D-form instruction ({:#010X})",
+                name,
+                r_offset,
+                ins
+            );
+            write_u32(data, ins_offset, (ins & !0x1F_FFFF) | (13 << 16));
+            write_u32(data, entry_offset, (r_offset & !3) + 2);
+            write_u32(data, entry_offset + 4, (r_info & !0xFF) | elf::R_PPC_ADDR16_LO);
             baked += 1;
         }
-        // Compact the remaining relocations and shrink the section. Nothing else moves.
-        let mut cursor = rela.offset;
-        for entry in &kept {
-            data[cursor..cursor + entsize].copy_from_slice(entry);
-            cursor += entsize;
-        }
-        data[cursor..rela.offset + rela.size].fill(0);
-        write_u32(data, shoff + rela_index * shentsize + 20, (kept.len() * entsize) as u32);
     }
     Ok(baked)
+}
+
+/// Resolves the converted small-data accesses in the linked executable `data`.
+/// Nothing else uses that combination: a real `@l` half never goes through `r13`, which is reserved.
+/// Returns the number of accesses resolved.
+pub fn resolve_executable(data: &mut [u8]) -> Result<usize> {
+    let (_, _, headers) = read_section_headers(data, elf::ET_EXEC)?;
+    let symtab = headers
+        .iter()
+        .find(|h| h.kind == elf::SHT_SYMTAB)
+        .ok_or_else(|| anyhow!("No symbol table: link without stripping symbols"))?;
+    let strtab =
+        headers.get(symtab.link as usize).ok_or_else(|| anyhow!("Invalid string table"))?.offset;
+    let sym_entsize = if symtab.entsize == 0 { 16 } else { symtab.entsize };
+    let mut sda_base = None;
+    for sym in (symtab.offset..symtab.offset + symtab.size).step_by(sym_entsize) {
+        if read_str(data, strtab + read_u32(data, sym)? as usize)? == "_SDA_BASE_" {
+            sda_base = Some(read_u32(data, sym + 4)?);
+            break;
+        }
+    }
+    let sda_base = sda_base.ok_or_else(|| anyhow!("_SDA_BASE_ is not defined"))?;
+
+    let mut resolved = 0;
+    for rela in headers.iter() {
+        if rela.kind != elf::SHT_RELA || rela.size == 0 {
+            continue;
+        }
+        let entsize = if rela.entsize == 0 { 12 } else { rela.entsize };
+        ensure!(entsize >= 12 && rela.size % entsize == 0, "Invalid relocation section");
+        let target = headers
+            .get(rela.info as usize)
+            .ok_or_else(|| anyhow!("Invalid relocation target section"))?;
+        if target.kind != elf::SHT_PROGBITS {
+            continue;
+        }
+        for entry_offset in (rela.offset..rela.offset + rela.size).step_by(entsize) {
+            let r_offset = read_u32(data, entry_offset)?;
+            let r_info = read_u32(data, entry_offset + 4)?;
+            if r_info & 0xFF != elf::R_PPC_ADDR16_LO {
+                continue;
+            }
+            let ins_addr = r_offset & !3;
+            let Some(rel) =
+                ins_addr.checked_sub(target.addr).filter(|&o| (o as usize) < target.size)
+            else {
+                continue;
+            };
+            let ins_offset = target.offset + rel as usize;
+            let ins = read_u32(data, ins_offset)?;
+            if !is_sda_dform(ins) || (ins >> 16) & 0x1F != 13 {
+                continue;
+            }
+            let sym = symtab.offset + (r_info >> 8) as usize * sym_entsize;
+            let st_value = read_u32(data, sym + 4)?;
+            let st_shndx = read_u16(data, sym + 14)?;
+            if !headers.get(st_shndx as usize).is_some_and(|s| is_sda2_section(&s.name)) {
+                continue;
+            }
+            let name = read_str(data, strtab + read_u32(data, sym)? as usize)?;
+            let address = st_value.wrapping_add(read_u32(data, entry_offset + 8)?);
+            ensure!(
+                ins & 0xFFFF == address & 0xFFFF,
+                "'{}' at {:#010X}: the linker wrote {:#06X}, expected the low half of {:#010X}",
+                name,
+                ins_addr,
+                ins & 0xFFFF,
+                address
+            );
+            let disp = address.wrapping_sub(sda_base) as i32;
+            let Ok(disp) = i16::try_from(disp) else {
+                bail!(
+                    "'{}' at {:#010X} is out of range of _SDA_BASE_ ({:#010X}), accessed at {:#010X}",
+                    name,
+                    address,
+                    sda_base,
+                    ins_addr
+                );
+            };
+            write_u32(data, ins_offset, (ins & !0xFFFF) | disp as u16 as u32);
+            write_u32(data, entry_offset, ins_addr);
+            write_u32(data, entry_offset + 4, (r_info & !0xFF) | elf::R_PPC_EMB_SDA21);
+            resolved += 1;
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -237,7 +285,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn bake_rewrites_only_sda2_relocations() {
+    fn bake_converts_only_sda2_relocations() {
         let mut obj = Object::new(BinaryFormat::Elf, Architecture::PowerPc, Endianness::Big);
         let text = obj.add_section(vec![], b".text".to_vec(), SectionKind::Text);
         // lwz r3, 0(r0) ×3, lfs f1, 0(r0)
@@ -289,29 +337,32 @@ mod test {
         let bake = SdaBakeData {
             sda_base: 0x806734E0,
             symbols: BTreeMap::from([("__GXData".to_string(), 0x80670788)]),
-            units: BTreeMap::from([(
-                "unit.c".to_string(),
-                BTreeMap::from([(".sdata2".to_string(), 0x80670000)]),
-            )]),
         };
-        assert_eq!(bake_object(&mut data, &bake, "unit.c").unwrap(), 3);
+        assert_eq!(bake_object(&mut data, &bake).unwrap(), 3);
 
         let file = object::File::parse(&*data).unwrap();
         use object::{Object as _, ObjectSection as _};
         let text = file.section_by_name(".text").unwrap();
         let bytes = text.data().unwrap();
         let ins = |i: usize| u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        // 0x80670788 - 0x806734E0 = -0x2D58
-        assert_eq!(ins(0), 0x806DD2A8);
+        // .sdata2 accesses are now r13-based, the .sdata access is untouched
+        assert_eq!(ins(0), 0x806D0000);
         assert_eq!(ins(1), 0x80600000);
-        assert_eq!(ins(2), 0x806DD2AC);
-        // 0x80670004 - 0x806734E0 = -0x34DC
-        assert_eq!(ins(3), 0xC02DCB24);
-        let relocs: Vec<_> = text.relocations().map(|(offset, _)| offset).collect();
-        assert_eq!(relocs, vec![4]);
-
-        // Missing unit split is an error
-        let mut data = obj.write().unwrap();
-        assert!(bake_object(&mut data, &bake, "other.c").is_err());
+        assert_eq!(ins(2), 0x806D0000);
+        assert_eq!(ins(3), 0xC02D0000);
+        // Every relocation is kept; the .sdata2 ones are ADDR16_LO on the low halfword, with their addends
+        let relocs: Vec<_> = text
+            .relocations()
+            .map(|(offset, r)| match r.flags() {
+                RelocationFlags::Elf { r_type } => (offset, r_type, r.addend()),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(relocs, vec![
+            (2, elf::R_PPC_ADDR16_LO, 0),
+            (4, elf::R_PPC_EMB_SDA21, 0),
+            (10, elf::R_PPC_ADDR16_LO, 4),
+            (14, elf::R_PPC_ADDR16_LO, 0),
+        ]);
     }
 }

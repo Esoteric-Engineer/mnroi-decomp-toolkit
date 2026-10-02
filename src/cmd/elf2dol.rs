@@ -94,22 +94,42 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     // Data sections
+    let mut data_sections: Vec<(&str, u32, Vec<u8>)> = vec![];
     for section in obj_file.sections().filter(|s| {
         section_kind(s) == SectionKind::Data
             && is_alloc(s.flags())
             && is_name_allowed(s, &args.deny_sections)
     }) {
-        log::debug!("Processing data section '{}'", section.name().unwrap_or("[error]"));
+        let name = section.name().unwrap_or("[error]");
         let address = section.address() as u32;
-        let size = align32(section.size() as u32);
-        *header.data_sections.get_mut(header.data_section_count).ok_or_else(|| {
-            anyhow!(
-                "Too many data sections (while processing '{}')",
-                section.name().unwrap_or("[error]")
-            )
-        })? = DolSection { offset, address, size };
+        let data = section.data()?;
+        // ProDG's DOL converter stores .dtors in the same DOL section as a .ctors list starting with -1, as `dtk dol split` expects
+        if name == ".dtors" {
+            if let Some((".ctors", ctors_address, ctors_data)) = data_sections.last_mut() {
+                let ctors_end = *ctors_address + ctors_data.len() as u32;
+                if ctors_data.starts_with(&[0xFF; 4])
+                    && address >= ctors_end
+                    && address <= align32(ctors_end)
+                {
+                    log::debug!("Merging data section '.dtors' into '.ctors'");
+                    ctors_data.resize((address - *ctors_address) as usize, 0);
+                    ctors_data.extend_from_slice(data);
+                    continue;
+                }
+            }
+        }
+        data_sections.push((name, address, data.to_vec()));
+    }
+    for (name, address, data) in data_sections {
+        log::debug!("Processing data section '{name}'");
+        let size = align32(data.len() as u32);
+        *header
+            .data_sections
+            .get_mut(header.data_section_count)
+            .ok_or_else(|| anyhow!("Too many data sections (while processing '{name}')"))? =
+            DolSection { offset, address, size };
         header.data_section_count += 1;
-        write_aligned(&mut out, section.data()?, size)?;
+        write_aligned(&mut out, &data, size)?;
         offset += size;
     }
 

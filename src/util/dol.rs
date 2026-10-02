@@ -407,6 +407,42 @@ pub fn process_dol(buf: &[u8], name: &str) -> Result<ObjInfo> {
                 (size, dol.virtual_data_at(buf, dol_section.address, size)?)
             };
 
+            if kind == ObjSectionKind::Data {
+                let is_code = |addr: u32| {
+                    dol.sections().iter().any(|s| {
+                        s.kind == DolSectionKind::Text
+                            && addr >= s.address
+                            && addr < s.address + s.size
+                    })
+                };
+                if let Some(dtors_offset) = find_prodg_dtors_offset(data, is_code) {
+                    log::debug!(
+                        "Splitting ProDG .ctors/.dtors section {:#010X} at {:#010X}",
+                        dol_section.address,
+                        dol_section.address + dtors_offset
+                    );
+                    for (name, start, end) in
+                        [(".ctors", 0, dtors_offset), (".dtors", dtors_offset, size)]
+                    {
+                        sections.push(ObjSection {
+                            name: name.to_string(),
+                            kind: ObjSectionKind::ReadOnlyData,
+                            address: (dol_section.address + start) as u64,
+                            size: (end - start) as u64,
+                            data: data[start as usize..end as usize].to_vec(),
+                            align: 0,
+                            elf_index: 0,
+                            relocations: Default::default(),
+                            virtual_address: Some((dol_section.address + start) as u64),
+                            file_offset: (dol_section.file_offset + start) as u64,
+                            section_known: true,
+                            splits: Default::default(),
+                        });
+                    }
+                    continue;
+                }
+            }
+
             sections.push(ObjSection {
                 name,
                 kind,
@@ -812,7 +848,62 @@ fn locate_text(obj: &mut ObjInfo) -> Result<()> {
     Ok(())
 }
 
+/// ProDG links `.ctors` and `.dtors` back to back, and its DOL converter stores both in one data section:
+// `-1`, function pointers, `0`, zero padding, then the same again for `.dtors`, then zero padding to the end.
+// Returns the offset of `.dtors` if `data` has that layout.
+fn find_prodg_dtors_offset(data: &[u8], is_code: impl Fn(u32) -> bool) -> Option<u32> {
+    if data.len() % 4 != 0 {
+        return None;
+    }
+    let words =
+        data.chunks_exact(4).map(|c| u32::from_be_bytes(c.try_into().unwrap())).collect_vec();
+    // Returns the index just past the list's null pointer
+    let list_end = |mut i: usize| -> Option<usize> {
+        if words.get(i) != Some(&u32::MAX) {
+            return None;
+        }
+        i += 1;
+        loop {
+            match *words.get(i)? {
+                0 => return Some(i + 1),
+                addr if addr & 3 == 0 && is_code(addr) => i += 1,
+                _ => return None,
+            }
+        }
+    };
+    let ctors_end = list_end(0)?;
+    let dtors_start = ctors_end + words[ctors_end..].iter().take_while(|&&w| w == 0).count();
+    let dtors_end = list_end(dtors_start)?;
+    if words[dtors_end..].iter().any(|&w| w != 0) {
+        return None;
+    }
+    Some((dtors_start * 4) as u32)
+}
+
 fn locate_ctors_dtors(obj: &mut ObjInfo) -> Result<()> {
+    // ProDG lists were already split into .ctors and .dtors by process_dol
+    let mut prodg_entries = vec![];
+    let mut found_prodg = false;
+    for (_, section) in obj.sections.iter() {
+        if !section.section_known || !matches!(section.name.as_str(), ".ctors" | ".dtors") {
+            continue;
+        }
+        found_prodg = true;
+        // Skip the leading -1
+        for chunk in section.data.chunks_exact(4).skip(1) {
+            let addr = u32::from_be_bytes(chunk.try_into()?);
+            if addr == 0 {
+                break;
+            }
+            let (section_index, _) = obj.sections.at_address(addr)?;
+            prodg_entries.push(SectionAddress::new(section_index, addr));
+        }
+    }
+    if found_prodg {
+        obj.known_functions.extend(prodg_entries.into_iter().map(|addr| (addr, None)));
+        return Ok(());
+    }
+
     // Add .ctors and .dtors functions to known functions if they exist
     let mut ctors_section_index = None;
     let mut dtors_section_index = None;
